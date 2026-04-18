@@ -1,70 +1,127 @@
 /**
-*  @filename    TeamEntry.js
-*  @desc        Out-of-game entry dispatcher for TeamPlay. Loads TeamState + TeamIPC, runs heartbeat loop.
-*               PR-2: adds real TeamState load/save + TeamIPC broadcasts. Game creation/join logic lands
-*               in PR-3 (TeamGameCoordinator). In-game dispatch (TeamLeader / TeamFollower) lands in PR-5/PR-6.
-*
-*  @typedef {import("../../../sdk/globals")}
-*/
+ *  @filename    TeamEntry.js
+ *  @desc        Out-of-game entry dispatcher for TeamPlay.
+ *
+ *               Each bot's D2Bot# entry script (`D2BotTeamLead.dbj` or
+ *               `D2BotTeamFollow.dbj`) includes this file and then calls
+ *               `TeamEntry.run("lead" | "follow")`. That call never returns — this
+ *               module owns the bot's OOG (lobby) lifetime.
+ *
+ *               Responsibilities in this PR (PR-2):
+ *                 1. Stash the role globally so logger/status can tag output.
+ *                 2. Eager-load TeamLogger, TeamStatus, TeamState, TeamIPC.
+ *                 3. Run a heartbeat loop that:
+ *                      - publishes this bot's per-char status to disk every tick
+ *                      - broadcasts heartbeat + updates team.json (leader) / cache (follower)
+ *                      - on the leader, periodically renders a team-wide status overview
+ *                        to the D2Bot# console so the user sees everyone at a glance
+ *                      - logs a liveness line so grep-able evidence exists in team.log
+ *
+ *               Responsibilities deferred to later PRs:
+ *                 - D2Bot.init / D2Bot.start / login drive loop        → PR-3 (GameCoordinator)
+ *                 - Game creation (leader) / join (follower)           → PR-3
+ *                 - In-game dispatch to TeamLeader / TeamFollower      → PR-5 / PR-6
+ *                 - SoloPlay OOG-check integration (AutoMule, torch)   → MVP-4
+ *
+ *  @typedef {import("../../../sdk/globals")}
+ */
 
 (function () {
-	/** @type {{ run: (role: "lead" | "follow") => void }} */
-	TeamEntry = {
-		run: function (role) {
-			// Expose role globally so logger/status/state modules can tag output.
-			TeamRole = role;
+	// How long to sleep between loop iterations. 5s is frequent enough that the
+	// on-screen team overview feels live but infrequent enough to avoid log spam.
+	const TICK_MS = 5000;
 
-			const TeamLogger = require("../Core/TeamLogger");
-			const TeamStatus = require("../Core/TeamStatus");
-			const TeamState = require("../Core/TeamState");
-			const TeamIPC = require("../Core/TeamIPC");
+	// Every N ticks, emit a verbose log line + (leader only) render team overview.
+	// At TICK_MS=5000, PERIODIC_TICKS=12 means every ~60 seconds.
+	const PERIODIC_TICKS = 12;
 
-			TeamLogger.info("entry", "TeamPlay OOG start", { role: role, profile: me.profile || me.windowtitle });
+	/**
+	 * Main OOG loop. Called once from the .dbj entry point; runs until the profile
+	 * is stopped.
+	 *
+	 * @param {"lead" | "follow"} role
+	 */
+	function run (role) {
+		// Expose role as a global so cross-module code (logger, status) can tag
+		// output without needing the role plumbed through every call site.
+		TeamRole = role;
 
-			// Boot state + IPC (first call creates team.json if missing).
-			const state = TeamState.get();
-			TeamIPC.init();
+		// Lazy-requires so a missing dependency surfaces as a clean error instead
+		// of breaking the .dbj parse.
+		const TeamLogger = require("../Core/TeamLogger");
+		const TeamStatus = require("../Core/TeamStatus");
+		const TeamState = require("../Core/TeamState");
+		const TeamIPC = require("../Core/TeamIPC");
+		const TeamProfile = require("../Core/TeamProfile");
 
-			TeamLogger.info("entry", "TeamState loaded", {
-				leader: state.leaderProfile,
-				followers: state.followers,
-				difficulty: state.difficulty,
-				gameCount: state.gameCount,
-				amILeader: TeamState.isLeader()
-			});
+		TeamLogger.info("entry", "TeamPlay OOG start", {
+			role: role,
+			profile: TeamProfile.name()
+		});
 
-			let tick = 0;
-			while (true) {
-				tick += 1;
-				try {
-					// Publish per-char status snapshot every tick (~5s).
-					TeamStatus.publish();
+		// Initialize TeamState (loads team.json or writes defaults) and wire the IPC
+		// listener up-front so we don't miss messages during the first loop iteration.
+		const bootState = TeamState.get();
+		TeamIPC.init();
 
-					// Heartbeat every tick; leader persists, follower cache-only.
-					TeamState.broadcastHeartbeat();
+		TeamLogger.info("entry", "TeamState loaded", {
+			leader: bootState.leaderProfile,
+			followers: bootState.followers,
+			difficulty: bootState.difficulty,
+			gameCount: bootState.gameCount,
+			amILeader: TeamState.isLeader()
+		});
 
-					// Leader: periodically render team overview + log its own state.
-					if (role === "lead" && tick % 12 === 0) {
+		let tick = 0;
+		while (true) {
+			tick += 1;
+			try {
+				// --- Every tick --------------------------------------------------
+
+				// Write this bot's status snapshot to data/TeamPlay/status/<profile>.json
+				// so the leader (and any external tooling) can assemble a team-wide view.
+				TeamStatus.publish();
+
+				// Record that we're alive (updates team.json on leader, cache on follower)
+				// and broadcast the heartbeat over IPC. This is how we detect crashed /
+				// disconnected team members in later PRs.
+				TeamState.broadcastHeartbeat();
+
+				// --- Every PERIODIC_TICKS ticks ---------------------------------
+
+				if (tick % PERIODIC_TICKS === 0) {
+					if (role === "lead") {
+						// Leader: show everyone at a glance in the D2Bot# console + log
+						// a richer team-state snapshot for post-hoc debugging.
 						TeamStatus.renderOverview(TeamStatus.readAll());
+
 						const fresh = TeamState.get();
 						TeamLogger.info("entry", "leader tick " + tick + " — team state", {
 							gameCount: fresh.gameCount,
 							gameName: fresh.gameName,
 							target: fresh.target,
-							heartbeats: Object.keys(fresh.heartbeats || {})
+							liveProfiles: Object.keys(fresh.heartbeats || {})
+						});
+					} else {
+						// Follower: light-touch log so team.log shows we're alive.
+						TeamLogger.debug("entry", "follower tick " + tick, {
+							target: TeamState.get().target
 						});
 					}
-
-					// Follower: occasional log line to confirm we're alive.
-					if (role === "follow" && tick % 12 === 0) {
-						TeamLogger.debug("entry", "follower tick " + tick, { target: TeamState.get().target });
-					}
-				} catch (e) {
-					TeamLogger.error("entry", "heartbeat loop exception: " + e.message, { stack: String(e) });
 				}
-
-				delay(5000);
+			} catch (e) {
+				// Never let an exception in the loop body kill the bot — log it and
+				// keep looping so the next tick has a chance to recover.
+				TeamLogger.error("entry", "heartbeat loop exception: " + e.message, {
+					stack: String(e)
+				});
 			}
+
+			delay(TICK_MS);
 		}
-	};
+	}
+
+	// Expose to the .dbj entry scripts via the global name. No `module.exports`
+	// because this file is `include()`'d, not `require()`'d.
+	TeamEntry = { run: run };
 })();
