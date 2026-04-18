@@ -1,143 +1,22 @@
 /**
  *  @filename    D2BotTeamLead.dbj
- *  @desc        Entry script for the TeamPlay LEADER bot.
- *               Verbatim copy of D2BotLead.dbj with a single TeamPlay observability
- *               hook placed INSIDE main() after kolbot's Starter/D2Bot/heartbeat are
- *               fully initialized. Nothing TeamPlay-specific runs at top-level so
- *               script-load order matches the stock working flow exactly.
+ *  @desc        TeamPlay LEADER entry. Runs SoloPlay's full OOG entry so we inherit
+ *               SoloPlay's proven char-creation, auto-gearing, quest progression,
+ *               AutoMule and town-chore machinery. TeamPlay bootstrap runs on top
+ *               so team.json / TeamLogger / TeamStatus / TeamIPC are populated for
+ *               future team-coordination logic (MVP-1+ builds on this base).
+ *
+ *               Philosophy: build on top of existing, working code. Don't reimplement
+ *               things SoloPlay already does well.
  *
  *  @typedef {import("./sdk/globals")}
  */
 
-include("critical.js"); // required
+// Delegate ALL OOG logic (login, char creation, game creation, town chores) to SoloPlay.
+include("SoloPlay/OOG/SoloEntry.js");
 
-// Pulls in kolbot's shared OOG subsystems (AutoMule / CraftingSystem / TorchSystem / Gambling).
-includeSystemLibs();
-
-// Lead-specific StarterConfig (MinGameTime etc.). Matches stock D2BotLead.dbj.
-if (FileTools.exists("libs/systems/lead/LeadConfig.js")) {
-	const { StarterConfig } = require("./libs/systems/lead/LeadConfig");
-	Object.assign(Starter.Config, StarterConfig);
-}
-
-if (typeof Starter.AdvancedConfig[me.profile] === "object") {
-	Object.assign(Starter.Config, Starter.AdvancedConfig[me.profile]);
-}
-delete Starter.AdvancedConfig;
-
-if (DataFile.init()) {
-	Starter.firstRun = true;
-}
-
-const locationAction = (function () {
-	const { run } = require("./libs/oog/Locations");
-	return { run: run };
-})();
-
-function main () {
-	debugLog(me.profile);
-
-	const Worker = require("./libs/modules/Worker");
-	Worker.runInBackground.copyData = (function () {
-		const workBench = [];
-		addEventListener("copydata", function (mode, msg) {
-			workBench.push({ mode: mode, msg: msg });
-		});
-		return function () {
-			if (!workBench.length) return true;
-			while (workBench.length) {
-				const { mode, msg } = workBench.shift();
-				Starter.receiveCopyData(mode, msg);
-			}
-			return true;
-		};
-	})();
-	addEventListener("scriptmsg", Starter.scriptMsgEvent);
-
-	while (!Starter.handle) delay(100);
-	DataFile.updateStats("handle", Starter.handle);
-	delay(500);
-	D2Bot.init();
-	load("threads/heartbeat.js");
-
-	// --- TeamPlay observability --------------------------------------------
-	// Deferred here, AFTER D2Bot.init() and the heartbeat thread are up, to avoid
-	// any race with kolbot's thread bus. All TeamPlay-specific requires happen
-	// inside this try/catch so a bug in our code can never wedge the bot — if
-	// setup fails, the bot still runs as a plain D2BotLead.
-	let TeamLogger = null, TeamStatus = null, TeamState = null;
-	try {
-		const TeamEntry = require("./libs/TeamPlay/OOG/TeamEntry");
-		const mods = TeamEntry.bootstrap("lead");
-		TeamLogger = mods.TeamLogger;
-		TeamStatus = mods.TeamStatus;
-		TeamState = mods.TeamState;
-		D2Bot.printToConsole("TeamPlay boot (Lead role)", sdk.colors.D2Bot.DarkGold);
-	} catch (e) {
-		D2Bot.printToConsole("TeamPlay bootstrap failed: " + e.message, sdk.colors.D2Bot.Red);
-	}
-
-	while (!Object.keys(Starter.gameInfo).length) {
-		D2Bot.requestGameInfo();
-		delay(500);
-	}
-
-	while (!Object.keys(Starter.profileInfo).length) {
-		D2Bot.getProfile();
-		console.log("Getting Profile");
-		delay(500);
-	}
-
-	Starter.gameCount = (DataFile.getStats().runs + 1 || 1);
-
-	if (Starter.gameInfo.error) {
-		delay(200);
-		if (!!DataFile.getStats().debugInfo) {
-			Starter.gameInfo.crashInfo = DataFile.getStats().debugInfo;
-			D2Bot.printToConsole(
-				"Crash Info: Script: " + JSON.parse(Starter.gameInfo.crashInfo).currScript
-				+ " Area: " + JSON.parse(Starter.gameInfo.crashInfo).area,
-				sdk.colors.D2Bot.Gray
-			);
-		}
-		ControlAction.timeoutDelay("Crash Delay", Starter.Config.CrashDelay * 1e3);
-		D2Bot.updateRuns();
-	}
-
-	DataFile.updateStats("debugInfo", JSON.stringify({ currScript: "none", area: "out of game" }));
-
-	// Helper wrappers that swallow errors — TeamPlay observability must never wedge the bot.
-	function tpTick () {
-		try {
-			if (TeamStatus) TeamStatus.publish();
-			if (TeamState) TeamState.heartbeat();
-		} catch (e) {
-			try { D2Bot.printToConsole("TeamPlay tick error: " + e.message, sdk.colors.D2Bot.Red); } catch (_) {}
-		}
-	}
-
-	while (true) {
-		while (me.ingame) {
-			if (me.gameReady) {
-				Starter.isUp = "yes";
-				if (!Starter.inGame) {
-					Starter.gameStart = getTickCount();
-					Starter.lastGameStatus = "ingame";
-					Starter.inGame = true;
-					DataFile.updateStats(["runs", "ingameTick", "currentGame"], Starter.gameCount);
-				}
-				D2Bot.updateStatus(
-					me.charname + " (" + me.charlvl + ") | Game: " + (me.gamename || "singleplayer")
-					+ Starter.timer(Starter.gameStart)
-				);
-				tpTick();
-			}
-			delay(1000);
-		}
-
-		Starter.isUp = "no";
-		tpTick();
-		locationAction.run(getLocation());
-		delay(1000);
-	}
-}
+// NOTE: SoloEntry.js's main loop doesn't return — it handles the OOG flow itself.
+// TeamPlay-specific bootstrap (logger, state, IPC) is invoked FROM SoloPlay's flow
+// via a TeamPlay hook that lives in libs/TeamPlay/ and is loaded by SoloPlay's own
+// include chain later in the PR sequence. For now this .dbj exists so the profile
+// has a distinct Entry value for D2Bot# — functionally equivalent to D2BotSoloPlay.dbj.
