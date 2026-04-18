@@ -195,8 +195,12 @@
 			if (typeof type !== "string" || typeof handler !== "function") return;
 			if (!handlers[type]) handlers[type] = [];
 			handlers[type].push(handler);
-			// Try to init opportunistically, but don't fail the registration if not yet ready.
-			init();
+			// NOTE: we deliberately do NOT call init() here. Registering a handler is a
+			// pure add-to-dict operation; the subscription on libs/modules/Team.js's
+			// copydata event happens when init() is explicitly called from main()
+			// (after kolbot's Starter + thread bus are up). Calling init() at
+			// module-load time would require Team.js, which races with kolbot's
+			// Team thread startup and causes D2BS to silently drop the script.
 		},
 
 		/**
