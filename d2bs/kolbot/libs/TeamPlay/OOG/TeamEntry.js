@@ -1,7 +1,8 @@
 /**
 *  @filename    TeamEntry.js
-*  @desc        Out-of-game entry dispatcher for TeamPlay. Delegates to role-specific loops.
-*               PR-1: stub — just prints role + idles in a heartbeat loop so the bot appears alive.
+*  @desc        Out-of-game entry dispatcher for TeamPlay. Loads TeamState + TeamIPC, runs heartbeat loop.
+*               PR-2: adds real TeamState load/save + TeamIPC broadcasts. Game creation/join logic lands
+*               in PR-3 (TeamGameCoordinator). In-game dispatch (TeamLeader / TeamFollower) lands in PR-5/PR-6.
 *
 *  @typedef {import("../../../sdk/globals")}
 */
@@ -10,33 +11,58 @@
 	/** @type {{ run: (role: "lead" | "follow") => void }} */
 	TeamEntry = {
 		run: function (role) {
-			// Expose role globally so logger/status modules can tag output.
+			// Expose role globally so logger/status/state modules can tag output.
 			TeamRole = role;
 
-			// Load logging + status modules.
 			const TeamLogger = require("../Core/TeamLogger");
 			const TeamStatus = require("../Core/TeamStatus");
+			const TeamState = require("../Core/TeamState");
+			const TeamIPC = require("../Core/TeamIPC");
 
-			TeamLogger.info("entry", "TeamPlay OOG start", { role: role, profile: me.profile });
+			TeamLogger.info("entry", "TeamPlay OOG start", { role: role, profile: me.profile || me.windowtitle });
 
-			// PR-1 stub: heartbeat loop + publish status every ~5s so the team overview works from day 1.
-			// Real OOG flow (TeamState load, game creation/join, in-game dispatch) lands in PR-2/PR-3.
+			// Boot state + IPC (first call creates team.json if missing).
+			const state = TeamState.get();
+			TeamIPC.init();
+
+			TeamLogger.info("entry", "TeamState loaded", {
+				leader: state.leaderProfile,
+				followers: state.followers,
+				difficulty: state.difficulty,
+				gameCount: state.gameCount,
+				amILeader: TeamState.isLeader()
+			});
+
 			let tick = 0;
 			while (true) {
 				tick += 1;
 				try {
+					// Publish per-char status snapshot every tick (~5s).
 					TeamStatus.publish();
-					if (tick % 12 === 0) {
-						// Every ~60s, log a heartbeat line so debug log shows the bot's alive.
-						TeamLogger.debug("heartbeat", "tick " + tick, { role: role });
-					}
-					// Only the leader prints the team overview to console (followers would spam).
+
+					// Heartbeat every tick; leader persists, follower cache-only.
+					TeamState.broadcastHeartbeat();
+
+					// Leader: periodically render team overview + log its own state.
 					if (role === "lead" && tick % 12 === 0) {
 						TeamStatus.renderOverview(TeamStatus.readAll());
+						const fresh = TeamState.get();
+						TeamLogger.info("entry", "leader tick " + tick + " — team state", {
+							gameCount: fresh.gameCount,
+							gameName: fresh.gameName,
+							target: fresh.target,
+							heartbeats: Object.keys(fresh.heartbeats || {})
+						});
+					}
+
+					// Follower: occasional log line to confirm we're alive.
+					if (role === "follow" && tick % 12 === 0) {
+						TeamLogger.debug("entry", "follower tick " + tick, { target: TeamState.get().target });
 					}
 				} catch (e) {
 					TeamLogger.error("entry", "heartbeat loop exception: " + e.message, { stack: String(e) });
 				}
+
 				delay(5000);
 			}
 		}
