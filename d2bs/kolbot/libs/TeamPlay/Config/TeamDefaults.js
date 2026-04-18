@@ -38,6 +38,17 @@
 		// Copydata mode used for TeamPlay IPC (distinct from existing 0xC0FFFEE team broadcast).
 		teamPlayCopyDataMode: 0xA11DA7A, // "AllData"
 
+		// Class map for auto char creation. When the bot reaches the D2 char-select
+		// screen and the profile's Character doesn't yet exist on the account, we
+		// auto-create it as the class listed here. Valid classes: amazon, assassin,
+		// barbarian, druid, necromancer, paladin, sorceress.
+		classByProfile: {
+			"TP_LightSorc":   "sorceress",
+			"TP_BlizzSorc":   "sorceress",
+			"TP_Hammerdin":   "paladin",
+			"TP_SingerBarb":  "barbarian"
+		},
+
 		version: 1
 	};
 })(module);

@@ -43,6 +43,7 @@
 		const TeamLogger = require("../Core/TeamLogger");
 		const TeamStatus = require("../Core/TeamStatus");
 		const TeamState = require("../Core/TeamState");
+		const TeamCharCreate = require("./TeamCharCreate");
 		// NOTE: TeamIPC is deliberately NOT required here. TeamIPC depends on
 		// libs/modules/Team.js, which is also loaded by kolbot as a background
 		// thread. Requiring it at top-level of the .dbj (before main() runs)
@@ -57,6 +58,12 @@
 		// matters for real-time follower sync, which happens in the in-game
 		// loop (later PRs).
 		const state = TeamState.get();
+
+		// Install the CharSelect hook so the bot auto-creates its configured
+		// char if it doesn't exist on the account yet. Must run after kolbot's
+		// locationAction has registered its stock handlers (which happened at
+		// .dbj top-level before main() was called).
+		TeamCharCreate.setup();
 
 		TeamLogger.info("bootstrap", "TeamPlay bootstrap complete", {
 			role: role,
