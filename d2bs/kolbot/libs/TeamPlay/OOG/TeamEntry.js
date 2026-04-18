@@ -43,12 +43,20 @@
 		const TeamLogger = require("../Core/TeamLogger");
 		const TeamStatus = require("../Core/TeamStatus");
 		const TeamState = require("../Core/TeamState");
-		const TeamIPC = require("../Core/TeamIPC");
+		// NOTE: TeamIPC is deliberately NOT required here. TeamIPC depends on
+		// libs/modules/Team.js, which is also loaded by kolbot as a background
+		// thread. Requiring it at top-level of the .dbj (before main() runs)
+		// races against Team.js's own thread startup and causes D2BS to silently
+		// drop the script. Callers (the main OOG loop) load TeamIPC lazily via
+		// require("../Core/TeamIPC") AFTER main() has fully initialized the
+		// kolbot Starter infrastructure.
+		const TeamIPC = null;
 
-		// Force state load (creates team.json on first run) and IPC listener wire-up.
-		// Do this up front so the very first OOG tick already has valid state.
+		// Force state load (creates team.json on first run). No IPC init yet —
+		// the leader-authoritative disk file works without IPC; IPC only
+		// matters for real-time follower sync, which happens in the in-game
+		// loop (later PRs).
 		const state = TeamState.get();
-		TeamIPC.init();
 
 		TeamLogger.info("bootstrap", "TeamPlay bootstrap complete", {
 			role: role,
