@@ -1,391 +1,429 @@
 /**
- *  @filename    D2BotTeamFollow.dbj
- *  @desc        Entry script for a TeamPlay FOLLOWER bot.
- *
- *               Sibling of the stock `D2BotFollow.dbj`. Reuses kolbot's OOG machinery
- *               (Starter / locationAction / FollowConfig.JoinSettings / copydata
- *               handshake) so game-join / lobby retry / FTJ handling all behave
- *               identically. TeamPlay observability is layered on top per-tick.
- *
- *               Follower responsibilities:
- *                 - Poll the leader via `D2Bot.requestGame(leaderProfile)` and join
- *                   the current game (handled by stock locationAction at JoinGame).
- *                 - Cache leader's authoritative team.json state in-memory (via TeamIPC).
- *                 - Publish per-char status so the leader can render the team overview.
- *
- *  @typedef {import("./sdk/globals")}
- *  @typedef {import("./libs/systems/torch/TorchSystem")}
- *  @typedef {import("./libs/systems/crafting/CraftingSystem")}
- *  @typedef {import("./libs/systems/gambling/Gambling")}
- */
+*  @filename    D2BotTeamFollow.dbj
+*  @desc        TeamPlay follower entry. Verbatim copy of D2BotFollow.dbj with a
+*               single TeamPlay observability hook placed INSIDE main() after
+*               kolbot's Starter/D2Bot/heartbeat are fully initialized. No
+*               TeamPlay code runs at top-level so script-load order matches the
+*               stock working flow exactly.
+*
+*  @typedef {import("./sdk/globals")}
+*  @typedef {import("./libs/systems/torch/TorchSystem")}
+*  @typedef {import("./libs/systems/crafting/CraftingSystem")}
+*  @typedef {import("./libs/systems/gambling/Gambling")}
+*/
 
-include("critical.js");
+include("critical.js"); // required
 
-// Pulls in shared OOG subsystems (AutoMule / CraftingSystem / TorchSystem / Gambling).
+// the only things we really need from these are their oog checks
 includeSystemLibs();
 
-// --- FollowConfig (JoinSettings) + per-profile advanced config ----------
-// JoinSettings maps leader-profile-name -> array of follower profile names, telling
-// kolbot which leader this follower should request games from.
-const { JoinSettings, StarterConfig } = require("./libs/systems/follow/FollowConfig");
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ //
+const {
+  JoinSettings,
+  StarterConfig
+} = require("./libs/systems/follow/FollowConfig");
 Object.assign(Starter.Config, StarterConfig);
 
-// Override.js — used below to tweak Starter.receiveCopyData so mode-3 pings update
-// our local snapshot of the current game without triggering a full state rebuild.
+
 const Overrides = require("./libs/modules/Override");
 
 if (typeof Starter.AdvancedConfig[me.profile] === "object") {
-	Object.assign(Starter.Config, Starter.AdvancedConfig[me.profile]);
+  Object.assign(Starter.Config, Starter.AdvancedConfig[me.profile]);
 }
 delete Starter.AdvancedConfig;
 
 if (DataFile.init()) {
-	Starter.firstRun = true;
+  Starter.firstRun = true;
 }
 
-// --- TeamPlay observability --------------------------------------------
-// One call bootstraps logger / state / IPC / status and emits the session-start
-// log line. See libs/TeamPlay/OOG/TeamEntry.js for what it does.
-const TeamEntry = require("./libs/TeamPlay/OOG/TeamEntry");
-const { TeamLogger, TeamStatus, TeamState, TeamIPC } = TeamEntry.bootstrap("follow");
-
-D2Bot.printToConsole("TeamPlay boot (Follow role)", sdk.colors.D2Bot.DarkGold);
-
-// --- Copy-data override for mode 3 --------------------------------------
-// When the leader asks us for our current game info (mode 3), we respond with the
-// game name/pass of the game WE'RE CURRENTLY IN. This lets other team members
-// reconnect after crashes without coordination via team.json alone.
 new Overrides.Override(Starter, Starter.receiveCopyData, function (orignal, mode, msg) {
-	if (mode === 3) {
-		Starter.isUp = (me.gameReady ? "yes" : "no");
-		if (!me.gameReady) return;
-		Starter.gameInfo.gameName = (me.gamename || "");
-		Starter.gameInfo.gamePass = (me.gamepassword || "");
-	} else {
-		orignal(mode, msg);
-	}
+  if (mode === 3) {
+    Starter.isUp = (me.gameReady ? "yes" : "no");
+    if (!me.gameReady) {
+      return;
+    }
+    Starter.gameInfo.gameName = (me.gamename || "");
+    Starter.gameInfo.gamePass = (me.gamepassword || "");
+  } else {
+    orignal(mode, msg);
+  }
 }).apply();
 
-// --- Location state machine (follower variant) --------------------------
-// The FOLLOWER's location handlers differ from the leader's: at JoinGame we poll
-// the leader via `D2Bot.requestGame(leaderProfile)` and fill the join dialog
-// with the returned game name. This is a near-verbatim copy of D2BotFollow.dbj's
-// locationAction — the logic for FTJ handling, re-join deduplication, and
-// lobby->chat transitions is delicate and battle-tested, so we don't rewrite it.
 const locationAction = (function () {
-	let announced = false;
-	let lastGameTick;
+  let announced = false;
+  let lastGameTick;
 
-	// Track games we've already been in to avoid rejoining the same one repeatedly.
-	const lastGame = [];
-	// Track per-leader poll state so we don't spam copydata.
-	const tracker = new Map();
+  const lastGame = [];
+  /**
+   * @type {Map<string, { lastAsked: number, game: string }>}
+   */
+  const tracker = new Map();
+  const Controls = require("./libs/modules/Control");
+  const {
+    locations,
+    addLocations,
+    run
+  } = require("./libs/oog/Locations");
 
-	const Controls = require("./libs/modules/Control");
-	const { locations, addLocations, run } = require("./libs/oog/Locations");
+  /** @param {string} leader */
+  const joinCheck = function (leader) {
+    D2Bot.requestGame(leader);
+    delay(500);
 
-	/**
-	 * Guard used by the retry-delay helper at JoinGame: if the leader's game ended
-	 * while we were waiting, abort the retry and let the outer loop re-poll.
-	 *
-	 * @param {string} leader
-	 */
-	const joinCheck = function (leader) {
-		D2Bot.requestGame(leader);
-		delay(500);
-		if (!Starter.joinInfo.inGame || (lastGame.length && lastGame.indexOf(Starter.joinInfo.gameName) === -1)) {
-			D2Bot.printToConsole("Game is finished. Stopping join delay.");
-			Starter.gameInfo.gameName = "";
-			Starter.gameInfo.gamePass = "";
-			return true;
-		}
-		return false;
-	};
+    if (!Starter.joinInfo.inGame || (lastGame.length && lastGame.indexOf(Starter.joinInfo.gameName) === -1)) {
+      D2Bot.printToConsole("Game is finished. Stopping join delay.");
+      Starter.gameInfo.gameName = "";
+      Starter.gameInfo.gamePass = "";
 
-	// Lobby / LobbyChat / WaitingInLine / CreateGame — standard kolbot follower
-	// behavior: cycle through AutoMule/Torch/etc. OOG checks, then open Join Game.
-	locations.set(sdk.game.locations.Lobby, function () {
-		D2Bot.updateStatus("Lobby");
-		me.blockKeys = false;
-		Starter.loginRetry = 0;
-		!Starter.firstLogin && (Starter.firstLogin = true);
+      return true;
+    }
 
-		if (Starter.Config.JoinChannel !== "") {
-			Controls.LobbyEnterChat.click();
-			return;
-		}
+    return false;
+  };
 
-		if (Starter.inGame) {
-			if (AutoMule.outOfGameCheck() || TorchSystem.outOfGameCheck()
-				|| Gambling.outOfGameCheck() || CraftingSystem.outOfGameCheck()) {
-				return;
-			}
-			console.log("updating runs");
-			D2Bot.updateRuns();
-			lastGameTick = getTickCount();
-			Starter.gameCount += 1;
-			Starter.lastGameStatus = "ready";
-			Starter.inGame = false;
+  locations.set(sdk.game.locations.Lobby,
+    function () {
+      D2Bot.updateStatus("Lobby");
 
-			if (typeof Starter.Config.JoinGameDelay === "number" && Starter.Config.JoinGameDelay > 0) {
-				ControlAction.timeoutDelay("Join Game Delay", Starter.Config.JoinGameDelay * 1e3);
-			}
-		}
-		Starter.LocationEvents.openJoinGameWindow();
-	});
+      me.blockKeys = false;
+      Starter.loginRetry = 0;
+      !Starter.firstLogin && (Starter.firstLogin = true);
 
-	addLocations([sdk.game.locations.WaitingInLine, sdk.game.locations.CreateGame], function () {
-		Controls.CancelCreateGame.click();
-		Controls.JoinGameWindow.click();
-	});
+      if (Starter.Config.JoinChannel !== "") {
+        Controls.LobbyEnterChat.click();
 
-	locations.set(sdk.game.locations.LobbyChat, function () {
-		D2Bot.updateStatus("Lobby Chat");
-		if (Starter.inGame) {
-			if (AutoMule.outOfGameCheck() || TorchSystem.outOfGameCheck()
-				|| Gambling.outOfGameCheck() || CraftingSystem.outOfGameCheck()) {
-				return;
-			}
-			console.log("updating runs");
-			D2Bot.updateRuns();
-			lastGameTick = getTickCount();
-			Starter.gameCount += 1;
-			Starter.lastGameStatus = "ready";
-			Starter.inGame = false;
-		}
-		if (!Starter.chatActionsDone) {
-			Starter.chatActionsDone = true;
-			ControlAction.timeoutDelay("Chat delay", Starter.Config.ChatActionsDelay * 1e3);
-			say("/j " + Starter.Config.JoinChannel);
-			delay(1000);
-			if (Starter.Config.FirstJoinMessage !== "") {
-				say(Starter.Config.FirstJoinMessage);
-				delay(500);
-			}
-		}
-		Starter.LocationEvents.openJoinGameWindow();
-	});
+        return;
+      }
 
-	// JoinGame — the heart of the follower flow. Poll each configured leader,
-	// fetch its current game, fill the join dialog, click join.
-	locations.set(sdk.game.locations.JoinGame, function (location) {
-		D2Bot.updateStatus("Join Game");
+      if (Starter.inGame) {
+        if (AutoMule.outOfGameCheck()
+          || TorchSystem.outOfGameCheck()
+          || Gambling.outOfGameCheck()
+          || CraftingSystem.outOfGameCheck()) {
+          return;
+        }
 
-		// First time at JoinGame, build the tracker Map from JoinSettings.
-		if (!tracker.size) {
-			for (let i in JoinSettings) {
-				if (JoinSettings.hasOwnProperty(i) && typeof i === "string") {
-					for (let profile of JoinSettings[i]) {
-						if (profile === me.profile || profile === "all") {
-							tracker.set(i, { lastAsked: 0, game: "" });
-						}
-					}
-				}
-			}
-		}
+        console.log("updating runs");
+        D2Bot.updateRuns();
 
-		if (!tracker.size && !announced) {
-			console.log("No leader");
-			D2Bot.printToConsole("No leader");
-			TeamLogger.error("entry", "JoinGame reached with empty tracker — check FollowConfig.JoinSettings");
-			announced = true;
-			return;
-		}
+        lastGameTick = getTickCount();
+        Starter.gameCount += 1;
+        Starter.lastGameStatus = "ready";
+        Starter.inGame = false;
 
-		// Up to 5 rounds of polling all leaders — if we don't get a valid game name,
-		// we bail out and let the outer OOG loop re-enter this state.
-		JoinLoop2:
-		for (let i = 0; i < 5; i += 1) {
-			for (let [leader] of tracker) {
-				Starter.joinInfo = {};
-				D2Bot.requestGame(leader);
-				delay(100);
+        if (typeof Starter.Config.JoinGameDelay === "number" && Starter.Config.JoinGameDelay > 0) {
+          ControlAction.timeoutDelay("Join Game Delay", Starter.Config.JoinGameDelay * 1e3);
+        }
+      }
 
-				if (!Starter.joinInfo.hasOwnProperty("gameName") || Starter.joinInfo.gameName === "") {
-					delay(500);
-					continue;
-				}
+      Starter.LocationEvents.openJoinGameWindow();
+    }
+  );
+  addLocations([sdk.game.locations.WaitingInLine, sdk.game.locations.CreateGame],
+    function () {
+      Controls.CancelCreateGame.click();
+      Controls.JoinGameWindow.click();
+    }
+  );
+  locations.set(sdk.game.locations.LobbyChat,
+    function () {
+      D2Bot.updateStatus("Lobby Chat");
 
-				tracker.set(leader, { lastAsked: getTickCount(), game: Starter.joinInfo.gameName });
+      if (Starter.inGame) {
+        if (AutoMule.outOfGameCheck()
+          || TorchSystem.outOfGameCheck()
+          || Gambling.outOfGameCheck()
+          || CraftingSystem.outOfGameCheck()) {
+          return;
+        }
 
-				if (lastGame.indexOf(Starter.joinInfo.gameName) === -1
-					|| Starter.lastGameStatus === "pending") {
-					Controls.JoinGameName.setText(Starter.joinInfo.gameName);
-					Controls.JoinGamePass.setText(Starter.joinInfo.gamePass);
+        console.log("updating runs");
+        D2Bot.updateRuns();
 
-					if (Starter.lastGameStatus === "pending"
-						|| (Starter.gameInfo.error && DataFile.getStats().gameName === Starter.joinInfo.gameName)) {
-						D2Bot.printToConsole("Failed to join game");
-						ControlAction.timeoutDelay("Join Delay", Starter.Config.JoinRetryDelay * 1000, joinCheck(leader));
-						D2Bot.updateRuns();
-						D2Bot.requestGame(leader);
-						delay(200);
-						if (!Starter.joinInfo.inGame) {
-							Starter.lastGameStatus = "ready";
-							break;
-						}
-					}
+        lastGameTick = getTickCount();
+        Starter.gameCount += 1;
+        Starter.lastGameStatus = "ready";
+        Starter.inGame = false;
+      }
 
-					if (!Starter.joinInfo.inGame) {
-						ControlAction.timeoutDelay("Leader Delay", (Starter.joinInfo.delay || 1000) + Time.seconds(3));
-						continue;
-					}
+      if (!Starter.chatActionsDone) {
+        Starter.chatActionsDone = true;
 
-					// FTJ avoidance: don't hammer join right after previous game ended.
-					if (getTickCount() - lastGameTick < 5000) {
-						ControlAction.timeoutDelay("Game Delay", (lastGameTick - getTickCount() + 5000));
-					}
+        ControlAction.timeoutDelay("Chat delay", Starter.Config.ChatActionsDelay * 1e3);
+        say("/j " + Starter.Config.JoinChannel);
+        delay(1000);
 
-					console.log("joining game " + Starter.joinInfo.gameName);
-					TeamLogger.info("entry", "joining leader's game", {
-						leader: leader, gameName: Starter.joinInfo.gameName
-					});
+        if (Starter.Config.FirstJoinMessage !== "") {
+          say(Starter.Config.FirstJoinMessage);
+          delay(500);
+        }
+      }
 
-					if (typeof Starter.Config.JoinDelay === "number") {
-						ControlAction.timeoutDelay("Custom Join Delay", Starter.Config.JoinDelay * 1e3);
-					}
+      Starter.LocationEvents.openJoinGameWindow();
+    }
+  );
+  locations.set(sdk.game.locations.JoinGame,
+    function (location) {
+      D2Bot.updateStatus("Join Game");
 
-					me.blockMouse = true;
-					DataFile.updateStats("gameName", Starter.joinInfo.gameName);
-					Controls.JoinGame.click();
-					me.blockMouse = false;
+      if (!tracker.size) {
+        for (let i in JoinSettings) {
+          if (JoinSettings.hasOwnProperty(i) && typeof i === "string") {
+            for (let profile of JoinSettings[i]) {
+              if (profile === me.profile || profile === "all") {
+                tracker.set(i, { lastAsked: 0, game: "" });
+              }
+            }
+          }
+        }
+      }
 
-					lastGame.push(Starter.joinInfo.gameName);
-					lastGame.length > tracker.size && lastGame.shift();
+      if (!tracker.size && !announced) {
+        console.log("No leader");
+        D2Bot.printToConsole("No leader");
+        announced = true;
 
-					Starter.lastGameStatus = "pending";
-					Starter.locationTimeout(15000, location);
-					break JoinLoop2;
-				} else {
-					// Leader still in the same game we just left — back off so we don't spam copydata.
-					if (lastGame.includes(Starter.joinInfo.gameName)) {
-						ControlAction.timeoutDelay(
-							"Waiting for new game from " + leader,
-							Time.seconds((Starter.joinInfo.inGame ? 5 : 2) * (i + 1))
-						);
-					}
-				}
-			}
-		}
-	});
+        return;
+      }
 
-	locations.set(sdk.game.locations.GameIsFull, function () {
-		D2Bot.printToConsole("Game is full");
-		Controls.JoinGameWindow.click();
-		lastGame.push(Starter.joinInfo.gameName);
-		Starter.lastGameStatus = "ready";
-	});
+      JoinLoop2:
+      for (let i = 0; i < 5; i += 1) {
+        for (let [leader, _check] of tracker) {
+          Starter.joinInfo = {};
+          D2Bot.requestGame(leader);
+          delay(100);
 
-	// TCP/IP host handshake (only matters if Mode=TCP/IP in profile.json; BNet skips these).
-	locations.set(sdk.game.locations.TcpIp, function () {
-		Profile().type === sdk.game.profiletype.TcpIpJoin ? Controls.TcpIpJoin.click() : Controls.TcpIpCancel.click();
-	});
-	locations.set(sdk.game.locations.TcpIpEnterIp, function () {
-		try {
-			if (!tracker.size) {
-				for (let i in JoinSettings) {
-					if (JoinSettings.hasOwnProperty(i) && typeof i === "string") {
-						for (let profile of JoinSettings[i]) {
-							if (profile === me.profile || profile === "all") tracker.set(i, { lastAsked: 0, game: "" });
-						}
-					}
-				}
-			}
-			mainLoop:
-			for (let i = 0; i < 3; i++) {
-				for (let [leader] of tracker) {
-					D2Bot.requestGame(leader);
-					if (Object.keys(Starter.joinInfo).length && Starter.joinInfo.gameName !== "") break mainLoop;
-				}
-			}
-			if (Controls.IPAdress.setText(Object.keys(Starter.joinInfo).length ? Starter.joinInfo.gameName : "localhost")
-				&& Controls.IPAdressOk.click()
-				&& Starter.locationTimeout(2e3, sdk.game.locations.TcpIpEnterIp)) {
-				getLocation() === sdk.game.locations.CharSelect && login(me.profile);
-			}
-		} catch (e) {
-			console.error(e);
-			TeamLogger.error("entry", "TcpIpEnterIp error: " + e.message);
-		}
-	});
+          if (!Starter.joinInfo.hasOwnProperty("gameName") || Starter.joinInfo.gameName === "") {
+            delay(500);
+            continue;
+          }
 
-	return { run: run };
+          /**
+          * @todo handle rejoin, need to keep track of game averages and when requesting game from a
+          * leader who's game we left get the current game time
+          * and see if there is x amount of time left that makes it worth it vs waiting for next.
+          */
+          tracker.set(leader, { lastAsked: getTickCount(), game: Starter.joinInfo.gameName });
+          if (lastGame.indexOf(Starter.joinInfo.gameName) === -1
+            || Starter.lastGameStatus === "pending") {
+            Controls.JoinGameName.setText(Starter.joinInfo.gameName);
+            Controls.JoinGamePass.setText(Starter.joinInfo.gamePass);
+
+            if (Starter.lastGameStatus === "pending"
+              || (Starter.gameInfo.error && DataFile.getStats().gameName === Starter.joinInfo.gameName)) {
+              D2Bot.printToConsole("Failed to join game");
+              ControlAction.timeoutDelay("Join Delay", Starter.Config.JoinRetryDelay * 1000, joinCheck(leader));
+              D2Bot.updateRuns();
+              D2Bot.requestGame(leader);
+              delay(200);
+
+              if (!Starter.joinInfo.inGame) {
+                Starter.lastGameStatus = "ready";
+
+                break;
+              }
+            }
+
+            if (!Starter.joinInfo.inGame) {
+              ControlAction.timeoutDelay("Leader Delay", (Starter.joinInfo.delay || 1000) + Time.seconds(3));
+              continue;
+            }
+
+            // Don't join immediately after previous game to avoid FTJ
+            if (getTickCount() - lastGameTick < 5000) {
+              ControlAction.timeoutDelay("Game Delay", (lastGameTick - getTickCount() + 5000));
+            }
+
+            console.log("joining game " + Starter.joinInfo.gameName);
+
+            if (typeof Starter.Config.JoinDelay === "number") {
+              ControlAction.timeoutDelay("Custom Join Delay", Starter.Config.JoinDelay * 1e3);
+            }
+
+            me.blockMouse = true;
+
+            DataFile.updateStats("gameName", Starter.joinInfo.gameName);
+            Controls.JoinGame.click();
+
+            me.blockMouse = false;
+
+            lastGame.push(Starter.joinInfo.gameName);
+
+            // Might need a fixed number. Right now it stores 1 game per leader.
+            lastGame.length > tracker.size && lastGame.shift();
+
+            Starter.lastGameStatus = "pending";
+            Starter.locationTimeout(15000, location);
+
+            break JoinLoop2;
+          } else {
+            // for now, if leader is in game and it's the last game we were in. delay to prevent copyData spam
+            if (lastGame.includes(Starter.joinInfo.gameName)) {
+              ControlAction.timeoutDelay(
+                "Waiting for new game from " + leader,
+                Time.seconds((Starter.joinInfo.inGame ? 5 : 2) * (i + 1))
+              );
+            }
+          }
+        }
+      }
+    }
+  );
+  locations.set(sdk.game.locations.GameIsFull,
+    function () {
+      D2Bot.printToConsole("Game is full");
+      Controls.JoinGameWindow.click();
+      lastGame.push(Starter.joinInfo.gameName);
+      Starter.lastGameStatus = "ready";
+    }
+  );
+  locations.set(sdk.game.locations.TcpIp,
+    function () {
+      Profile().type === sdk.game.profiletype.TcpIpJoin
+        ? Controls.TcpIpJoin.click()
+        : Controls.TcpIpCancel.click();
+    }
+  );
+  locations.set(sdk.game.locations.TcpIpEnterIp,
+    function () {
+      try {
+        if (!tracker.size) {
+          for (let i in JoinSettings) {
+            if (JoinSettings.hasOwnProperty(i) && typeof i === "string") {
+              for (let profile of JoinSettings[i]) {
+                if (profile === me.profile || profile === "all") {
+                  tracker.set(i, { lastAsked: 0, game: "" });
+                }
+              }
+            }
+          }
+        }
+
+        mainLoop:
+        for (let i = 0; i < 3; i++) {
+          for (let [leader] of tracker) {
+            D2Bot.requestGame(leader);
+
+            if (Object.keys(Starter.joinInfo).length && Starter.joinInfo.gameName !== "") {
+              break mainLoop;
+            }
+          }
+        }
+
+        if (Controls.IPAdress.setText(Object.keys(Starter.joinInfo).length ? Starter.joinInfo.gameName : "localhost")
+          && Controls.IPAdressOk.click()
+          && Starter.locationTimeout(2e3, sdk.game.locations.TcpIpEnterIp)) {
+          getLocation() === sdk.game.locations.CharSelect && login(me.profile);
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  );
+
+  return {
+    run: run,
+  };
 })();
 
-/**
- * Follower main loop. Structurally identical to D2BotFollow.dbj's main() with
- * TeamPlay status/heartbeat calls added per iteration.
- */
 function main () {
-	debugLog(me.profile);
-	addEventListener("copydata", Starter.receiveCopyData);
-	addEventListener("scriptmsg", Starter.scriptMsgEvent);
+  debugLog(me.profile);
+  addEventListener("copydata", Starter.receiveCopyData);
+  addEventListener("scriptmsg", Starter.scriptMsgEvent);
 
-	while (!Starter.handle) delay(100);
-	DataFile.updateStats("handle", Starter.handle);
-	D2Bot.init();
-	load("threads/heartbeat.js");
+  while (!Starter.handle) {
+    delay(100);
+  }
 
-	while (!Object.keys(Starter.gameInfo).length) {
-		D2Bot.requestGameInfo();
-		delay(500);
-	}
+  DataFile.updateStats("handle", Starter.handle);
+  D2Bot.init();
+  load("threads/heartbeat.js");
 
-	Starter.gameCount = (DataFile.getStats().runs + 1 || 1);
+  // --- TeamPlay observability --------------------------------------------
+  // Deferred here, AFTER D2Bot.init() + heartbeat thread are up, so top-level
+  // script load matches stock D2BotFollow exactly. Wrapped in try/catch so a
+  // TeamPlay bug can never wedge the bot — if setup fails, the bot still runs
+  // as a plain D2BotFollow.
+  let TeamLogger = null, TeamStatus = null, TeamState = null;
+  try {
+    const TeamEntry = require("./libs/TeamPlay/OOG/TeamEntry");
+    const mods = TeamEntry.bootstrap("follow");
+    TeamLogger = mods.TeamLogger;
+    TeamStatus = mods.TeamStatus;
+    TeamState = mods.TeamState;
+    D2Bot.printToConsole("TeamPlay boot (Follow role)", sdk.colors.D2Bot.DarkGold);
+  } catch (e) {
+    D2Bot.printToConsole("TeamPlay bootstrap failed: " + e.message, sdk.colors.D2Bot.Red);
+  }
 
-	// Crash recovery — same as leader flow.
-	if (Starter.gameInfo.error) {
-		delay(200);
-		if (!!DataFile.getStats().debugInfo) {
-			Starter.gameInfo.crashInfo = DataFile.getStats().debugInfo;
-			D2Bot.printToConsole(
-				"Crash Info: Script: " + JSON.parse(Starter.gameInfo.crashInfo).currScript
-				+ " Area: " + JSON.parse(Starter.gameInfo.crashInfo).area,
-				sdk.colors.D2Bot.Gray
-			);
-			TeamLogger.warn("entry", "crash recovery", JSON.parse(Starter.gameInfo.crashInfo));
-		}
-		ControlAction.timeoutDelay("Crash Delay", Starter.Config.CrashDelay * 1e3);
-		D2Bot.updateRuns();
-	}
+  /** Per-tick TeamPlay observability. Errors never propagate — logging must not wedge the bot. */
+  function tpTick () {
+    try {
+      if (TeamStatus) TeamStatus.publish();
+      if (TeamState) TeamState.heartbeat();
+    } catch (e) {
+      try { D2Bot.printToConsole("TeamPlay tick error: " + e.message, sdk.colors.D2Bot.Red); } catch (_) {}
+    }
+  }
 
-	DataFile.updateStats("debugInfo", JSON.stringify({ currScript: "none", area: "out of game" }));
+  while (!Object.keys(Starter.gameInfo).length) {
+    D2Bot.requestGameInfo();
+    delay(500);
+  }
 
-	while (!Object.keys(Starter.profileInfo).length) {
-		D2Bot.getProfile();
-		console.log("Getting Profile");
-		delay(500);
-	}
+  Starter.gameCount = (DataFile.getStats().runs + 1 || 1);
 
-	TeamLogger.info("entry", "follower OOG main loop entering");
+  if (Starter.gameInfo.error) {
+    delay(200);
 
-	while (true) {
-		// In-game heartbeat + status publish.
-		while (me.ingame) {
-			if (me.gameReady) {
-				if (!Starter.inGame) {
-					console.log("ÿc4Updating Status");
-					Starter.lastGameStatus = "ingame";
-					Starter.inGame = true;
-					Starter.gameStart = getTickCount();
-					DataFile.updateStats("runs", Starter.gameCount);
-					TeamLogger.info("entry", "entered game " + me.gamename);
-				}
-				D2Bot.updateStatus(
-					me.charname + " (" + me.charlvl + ") | Game: " + (me.gamename || "singleplayer")
-					+ Starter.timer(Starter.gameStart)
-				);
-				TeamStatus.publish();
-				TeamState.heartbeat();
-			}
-			delay(1000);
-		}
+    if (!!DataFile.getStats().debugInfo) {
+      Starter.gameInfo.crashInfo = DataFile.getStats().debugInfo;
 
-		// Out of game — advance location state machine + TeamPlay observability tick.
-		TeamStatus.publish();
-		TeamState.heartbeat();
+      D2Bot.printToConsole(
+        "Crash Info: Script: " + JSON.parse(Starter.gameInfo.crashInfo).currScript
+        + " Area: " + JSON.parse(Starter.gameInfo.crashInfo).area,
+        sdk.colors.D2Bot.Gray
+      );
+    }
 
-		locationAction.run(getLocation());
-		delay(1000);
-	}
+    ControlAction.timeoutDelay("Crash Delay", Starter.Config.CrashDelay * 1e3);
+    D2Bot.updateRuns();
+  }
+
+  DataFile.updateStats("debugInfo", JSON.stringify({ currScript: "none", area: "out of game" }));
+
+  while (!Object.keys(Starter.profileInfo).length) {
+    D2Bot.getProfile();
+    console.log("Getting Profile");
+    delay(500);
+  }
+
+  while (true) {
+    // returns true before actually in game so we can't only use this check
+    while (me.ingame) {
+      // returns false when switching acts so we can't use while
+      if (me.gameReady) {
+        if (!Starter.inGame) {
+          console.log("ÿc4Updating Status");
+          Starter.lastGameStatus = "ingame";
+          Starter.inGame = true;
+          Starter.gameStart = getTickCount();
+
+          DataFile.updateStats("runs", Starter.gameCount);
+        }
+
+        D2Bot.updateStatus(
+          me.charname + " (" + me.charlvl + ") | Game: " + (me.gamename || "singleplayer")
+          + Starter.timer(Starter.gameStart)
+        );
+        tpTick();
+      }
+
+      delay(1000);
+    }
+
+    tpTick();
+    locationAction.run(getLocation());
+    delay(1000);
+  }
 }
