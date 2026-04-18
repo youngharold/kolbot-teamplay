@@ -1,20 +1,187 @@
 /**
-*  @filename    D2BotTeamLead.dbj
-*  @author      TeamPlay
-*  @desc        Entry script for the TeamPlay leader bot. Actual logic is in TeamPlay/OOG/TeamEntry.js
-*
-*  @typedef {import("./sdk/globals")}
-*/
+ *  @filename    D2BotTeamLead.dbj
+ *  @desc        Entry script for the TeamPlay LEADER bot.
+ *
+ *               Structurally a sibling of the stock `D2BotLead.dbj`: we reuse the
+ *               exact same kolbot OOG machinery (Starter / locationAction / heartbeat
+ *               thread) so login, char creation, game creation, and retry/FTJ
+ *               handling all behave identically. On top of that we layer TeamPlay
+ *               observability (TeamLogger / TeamStatus / TeamState / TeamIPC) so the
+ *               team's shared truth, per-char status, and debug logs are populated
+ *               every OOG tick.
+ *
+ *               Leader responsibilities:
+ *                 - Create games (name = profile.json `GameName` + auto gameCount).
+ *                 - Respond to follower `D2Bot.requestGame` pings with current game info
+ *                   (handled by default Starter.receiveCopyData logic).
+ *                 - Maintain the authoritative `data/TeamPlay/team.json`.
+ *                 - Render periodic team status overview to D2Bot# console.
+ *
+ *  @typedef {import("./sdk/globals")}
+ */
 
-// No touchy!
 include("critical.js");
+
+// Pulls in kolbot's shared OOG subsystems (AutoMule / CraftingSystem / TorchSystem /
+// Gambling). They provide `outOfGameCheck()` hooks that D2BotLead's location handlers
+// call between games.
+includeSystemLibs();
+
+// --- LeadConfig + per-profile advanced config ----------------------------
+// Same pattern as D2BotLead.dbj. MinGameTime / CrashDelay / etc. come from here.
+if (FileTools.exists("libs/systems/lead/LeadConfig.js")) {
+	const { StarterConfig } = require("./libs/systems/lead/LeadConfig");
+	Object.assign(Starter.Config, StarterConfig);
+}
+if (typeof Starter.AdvancedConfig[me.profile] === "object") {
+	Object.assign(Starter.Config, Starter.AdvancedConfig[me.profile]);
+}
+delete Starter.AdvancedConfig;
+
+// Per-profile DataFile (runs / chickens / deaths stats, last-game crash info).
+if (DataFile.init()) {
+	Starter.firstRun = true;
+}
+
+// --- TeamPlay observability --------------------------------------------
+// One call bootstraps logger / state / IPC / status and emits the session-start
+// log line. See libs/TeamPlay/OOG/TeamEntry.js for what it does.
+include("TeamPlay/OOG/TeamEntry.js");
+const { TeamLogger, TeamStatus, TeamState, TeamIPC } = TeamEntry.bootstrap("lead");
 
 D2Bot.printToConsole("TeamPlay boot (Lead role)", sdk.colors.D2Bot.DarkGold);
 
-if (!include("TeamPlay/OOG/TeamEntry.js")) {
-  D2Bot.printToConsole("TeamPlay: Failed to include TeamEntry.js", sdk.colors.D2Bot.Red);
-  D2Bot.stop();
-}
+// --- kolbot OOG location state machine ----------------------------------
+// Standard D2BotLead flow: tells the bot what to do at every D2 login/lobby/
+// create-game screen. We import only `run` from libs/oog/Locations — kolbot's
+// default handlers are already populated there.
+const locationAction = (function () {
+	const { run } = require("./libs/oog/Locations");
+	return { run: run };
+})();
 
-// Hand off to TeamEntry with role = "lead"
-TeamEntry.run("lead");
+/**
+ * Main OOG loop for the leader. Matches the `main()` function of D2BotLead.dbj
+ * with TeamPlay status/heartbeat sprinkled into each iteration so the team
+ * overview stays fresh.
+ */
+function main () {
+	debugLog(me.profile);
+
+	// Copy-data fan-in. D2Bot#'s Events arrive on a single thread, so we queue
+	// messages on a worker and dispatch to Starter.receiveCopyData serially.
+	// This is the exact pattern D2BotLead uses — preserves lead<->follow handshake.
+	const Worker = require("./libs/modules/Worker");
+	Worker.runInBackground.copyData = (function () {
+		const workBench = [];
+		addEventListener("copydata", function (mode, msg) {
+			workBench.push({ mode: mode, msg: msg });
+		});
+		return function () {
+			if (!workBench.length) return true;
+			while (workBench.length) {
+				const { mode, msg } = workBench.shift();
+				Starter.receiveCopyData(mode, msg);
+			}
+			return true;
+		};
+	})();
+	addEventListener("scriptmsg", Starter.scriptMsgEvent);
+
+	// Wait for D2Bot# to hand us the profile handle (process id etc.).
+	while (!Starter.handle) delay(100);
+	DataFile.updateStats("handle", Starter.handle);
+	delay(500);
+
+	D2Bot.init();
+	load("threads/heartbeat.js");
+
+	// Fetch initial game info (GameName / GamePass / Difficulty from profile.json).
+	while (!Object.keys(Starter.gameInfo).length) {
+		D2Bot.requestGameInfo();
+		delay(500);
+	}
+	// Fetch initial profile info (Account / Character / Realm).
+	while (!Object.keys(Starter.profileInfo).length) {
+		D2Bot.getProfile();
+		console.log("Getting Profile");
+		delay(500);
+	}
+
+	// Start gameCount where the last run left off (crash/restart resume).
+	Starter.gameCount = (DataFile.getStats().runs + 1 || 1);
+
+	// Crash-recovery: last session ended with an error. Print crash context + wait
+	// the configured CrashDelay so we don't hammer BNet immediately.
+	if (Starter.gameInfo.error) {
+		delay(200);
+		if (!!DataFile.getStats().debugInfo) {
+			Starter.gameInfo.crashInfo = DataFile.getStats().debugInfo;
+			D2Bot.printToConsole(
+				"Crash Info: Script: " + JSON.parse(Starter.gameInfo.crashInfo).currScript
+				+ " Area: " + JSON.parse(Starter.gameInfo.crashInfo).area,
+				sdk.colors.D2Bot.Gray
+			);
+			TeamLogger.warn("entry", "crash recovery", JSON.parse(Starter.gameInfo.crashInfo));
+		}
+		ControlAction.timeoutDelay("Crash Delay", Starter.Config.CrashDelay * 1e3);
+		D2Bot.updateRuns();
+	}
+
+	DataFile.updateStats("debugInfo", JSON.stringify({ currScript: "none", area: "out of game" }));
+
+	TeamLogger.info("entry", "leader OOG main loop entering", {
+		gameCount: Starter.gameCount,
+		gameName: Starter.gameInfo.gameName,
+		difficulty: Starter.gameInfo.difficulty
+	});
+
+	// --- The outer loop: alternate between in-game heartbeat and OOG actions ---
+	while (true) {
+		// In-game loop. `me.ingame` is true while the char is inside a D2 game
+		// (may still be loading, which is why we separately check me.gameReady).
+		while (me.ingame) {
+			if (me.gameReady) {
+				Starter.isUp = "yes";
+
+				// First tick after game load — capture start time + mark in-game.
+				if (!Starter.inGame) {
+					Starter.gameStart = getTickCount();
+					Starter.lastGameStatus = "ingame";
+					Starter.inGame = true;
+					DataFile.updateStats(["runs", "ingameTick", "currentGame"], Starter.gameCount);
+					TeamLogger.info("entry", "entered game " + me.gamename, {
+						gameCount: Starter.gameCount
+					});
+				}
+
+				// D2Bot# console status bar: char name / level / game / elapsed.
+				D2Bot.updateStatus(
+					me.charname + " (" + me.charlvl + ") | Game: " + (me.gamename || "singleplayer")
+					+ Starter.timer(Starter.gameStart)
+				);
+
+				// --- TeamPlay tick: publish status + bump heartbeat in-game too ---
+				TeamStatus.publish();
+				TeamState.heartbeat();
+			}
+			delay(1000);
+		}
+
+		// Out of game — advance the OOG location state machine.
+		Starter.isUp = "no";
+
+		// Publish a status update that reflects the OOG state.
+		TeamStatus.publish();
+		TeamState.heartbeat();
+
+		// Periodically render the team overview to our console so the user sees
+		// the whole team at a glance (leader-only rendering avoids spam).
+		if ((getTickCount() / 1000 | 0) % 60 === 0) {
+			TeamStatus.renderOverview(TeamStatus.readAll());
+		}
+
+		locationAction.run(getLocation());
+		delay(1000);
+	}
+}
