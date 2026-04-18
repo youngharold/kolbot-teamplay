@@ -1,0 +1,20 @@
+/**
+*  @filename    D2BotTeamFollow.dbj
+*  @author      TeamPlay
+*  @desc        Entry script for TeamPlay follower bots. Actual logic is in TeamPlay/OOG/TeamEntry.js
+*
+*  @typedef {import("./sdk/globals")}
+*/
+
+// No touchy!
+include("critical.js");
+
+D2Bot.printToConsole("TeamPlay boot (Follow role)", sdk.colors.D2Bot.DarkGold);
+
+if (!include("TeamPlay/OOG/TeamEntry.js")) {
+  D2Bot.printToConsole("TeamPlay: Failed to include TeamEntry.js", sdk.colors.D2Bot.Red);
+  D2Bot.stop();
+}
+
+// Hand off to TeamEntry with role = "follow"
+TeamEntry.run("follow");
