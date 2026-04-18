@@ -46,7 +46,7 @@ if (DataFile.init()) {
 // --- TeamPlay observability --------------------------------------------
 // One call bootstraps logger / state / IPC / status and emits the session-start
 // log line. See libs/TeamPlay/OOG/TeamEntry.js for what it does.
-include("TeamPlay/OOG/TeamEntry.js");
+const TeamEntry = require("./libs/TeamPlay/OOG/TeamEntry");
 const { TeamLogger, TeamStatus, TeamState, TeamIPC } = TeamEntry.bootstrap("follow");
 
 D2Bot.printToConsole("TeamPlay boot (Follow role)", sdk.colors.D2Bot.DarkGold);

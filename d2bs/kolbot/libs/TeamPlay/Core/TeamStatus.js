@@ -10,6 +10,7 @@
 */
 
 (function (module) {
+	const TeamProfile = require("./TeamProfile");
 	const STATUS_DIR = "data/TeamPlay/status";
 
 	/**
@@ -34,8 +35,8 @@
 	function buildCharStatus () {
 		// PR-1: return a skeleton; fields populated as modules come online.
 		return {
-			profile: me.profile || "?",
-			role: (typeof TeamRole !== "undefined") ? TeamRole : "?",
+			profile: TeamProfile.name(),
+			role: TeamProfile.role(),
 			charName: me.name || "?",
 			charClass: ["amazon", "sorceress", "necromancer", "paladin", "barbarian", "druid", "assassin"][me.classid] || "?",
 			level: me.charlvl || 0,

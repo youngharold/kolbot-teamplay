@@ -63,8 +63,9 @@
 	function write (level, category, message, data) {
 		ensureDir();
 		try {
-			const profile = me.profile || "?";
-			const role = (typeof TeamRole !== "undefined") ? TeamRole : "?";
+			const TeamProfile = require("./TeamProfile");
+			const profile = TeamProfile.name();
+			const role = TeamProfile.role();
 			const line = formatLine(level, profile, role, category, message, data);
 
 			// Per-profile log
