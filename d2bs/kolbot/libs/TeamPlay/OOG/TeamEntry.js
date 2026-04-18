@@ -43,7 +43,7 @@
 		const TeamLogger = require("../Core/TeamLogger");
 		const TeamStatus = require("../Core/TeamStatus");
 		const TeamState = require("../Core/TeamState");
-		const TeamCharCreate = require("./TeamCharCreate");
+		const TeamCharCreate = require("../OOG/TeamCharCreate");
 		// NOTE: TeamIPC is deliberately NOT required here. TeamIPC depends on
 		// libs/modules/Team.js, which is also loaded by kolbot as a background
 		// thread. Requiring it at top-level of the .dbj (before main() runs)
