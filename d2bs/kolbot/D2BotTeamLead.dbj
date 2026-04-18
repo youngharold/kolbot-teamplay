@@ -1,0 +1,20 @@
+/**
+*  @filename    D2BotTeamLead.dbj
+*  @author      TeamPlay
+*  @desc        Entry script for the TeamPlay leader bot. Actual logic is in TeamPlay/OOG/TeamEntry.js
+*
+*  @typedef {import("./sdk/globals")}
+*/
+
+// No touchy!
+include("critical.js");
+
+D2Bot.printToConsole("TeamPlay boot (Lead role)", sdk.colors.D2Bot.DarkGold);
+
+if (!include("TeamPlay/OOG/TeamEntry.js")) {
+  D2Bot.printToConsole("TeamPlay: Failed to include TeamEntry.js", sdk.colors.D2Bot.Red);
+  D2Bot.stop();
+}
+
+// Hand off to TeamEntry with role = "lead"
+TeamEntry.run("lead");
