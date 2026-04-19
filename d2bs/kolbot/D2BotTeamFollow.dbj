@@ -1,0 +1,14 @@
+/**
+ *  @filename    D2BotTeamFollow.dbj
+ *  @desc        TeamPlay FOLLOWER entry. Runs SoloPlay's full OOG entry so we inherit
+ *               SoloPlay's proven char-creation, auto-gearing, quest progression,
+ *               AutoMule and town-chore machinery. TeamPlay bootstrap will hook in
+ *               later in the PR sequence to add team coordination.
+ *
+ *               Philosophy: build on top of existing, working code. Don't reimplement
+ *               things SoloPlay already does well.
+ *
+ *  @typedef {import("./sdk/globals")}
+ */
+
+include("SoloPlay/OOG/SoloEntry.js");
