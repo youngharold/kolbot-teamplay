@@ -12,14 +12,15 @@
 		gamePass: "tpteam",
 
 		// Static leader profile name (must match a D2Bot# profile with Entry=D2BotTeamLead.dbj).
+		// SoloPlay requires the <MODE>-<CLASS>-<NUM> convention; see SoloPlay README.
 		// MVP-1: Lightning Sorc. Swap to Hammerdin profile name once she has Enigma.
-		leaderProfile: "TP_LightSorc",
+		leaderProfile: "SCL-SORC-91",
 
 		// Follower profile names (Entry=D2BotTeamFollow.dbj).
 		followerProfiles: [
-			"TP_BlizzSorc",
-			"TP_Hammerdin",
-			"TP_SingerBarb"
+			"SCL-SORC-92",   // Blizz/Fire Sorc
+			"SCL-PAL-91",    // Hammerdin
+			"SCL-BARB-91"    // Singer Barb
 		],
 
 		// Difficulty pinned for MVP-1 (Normal). Difficulty advance arrives in MVP-2+.
@@ -43,10 +44,10 @@
 		// auto-create it as the class listed here. Valid classes: amazon, assassin,
 		// barbarian, druid, necromancer, paladin, sorceress.
 		classByProfile: {
-			"TP_LightSorc":   "sorceress",
-			"TP_BlizzSorc":   "sorceress",
-			"TP_Hammerdin":   "paladin",
-			"TP_SingerBarb":  "barbarian"
+			"SCL-SORC-91":  "sorceress",
+			"SCL-SORC-92":  "sorceress",
+			"SCL-PAL-91":   "paladin",
+			"SCL-BARB-91":  "barbarian"
 		},
 
 		version: 1
