@@ -1,14 +1,22 @@
 /**
  *  @filename    D2BotTeamFollow.dbj
- *  @desc        TeamPlay FOLLOWER entry. Runs SoloPlay's full OOG entry so we inherit
- *               SoloPlay's proven char-creation, auto-gearing, quest progression,
- *               AutoMule and town-chore machinery. TeamPlay bootstrap will hook in
- *               later in the PR sequence to add team coordination.
+ *  @desc        TeamPlay FOLLOWER entry.
  *
- *               Philosophy: build on top of existing, working code. Don't reimplement
- *               things SoloPlay already does well.
+ *               Loads TeamPlay's observability layer first, then delegates to
+ *               SoloPlay's OOG entry. Same structural pattern as the Lead entry —
+ *               only the role label differs.
  *
  *  @typedef {import("./sdk/globals")}
  */
+
+include("critical.js");
+
+try {
+	const TeamEntry = require("./libs/TeamPlay/OOG/TeamEntry");
+	TeamEntry.bootstrap("follow");
+	D2Bot.printToConsole("TeamPlay boot (Follow role)", sdk.colors.D2Bot.DarkGold);
+} catch (e) {
+	D2Bot.printToConsole("TeamPlay bootstrap failed: " + e.message, sdk.colors.D2Bot.Red);
+}
 
 include("SoloPlay/OOG/SoloEntry.js");

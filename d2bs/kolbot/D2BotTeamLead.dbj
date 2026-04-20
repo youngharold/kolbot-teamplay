@@ -1,22 +1,35 @@
 /**
  *  @filename    D2BotTeamLead.dbj
- *  @desc        TeamPlay LEADER entry. Runs SoloPlay's full OOG entry so we inherit
- *               SoloPlay's proven char-creation, auto-gearing, quest progression,
- *               AutoMule and town-chore machinery. TeamPlay bootstrap runs on top
- *               so team.json / TeamLogger / TeamStatus / TeamIPC are populated for
- *               future team-coordination logic (MVP-1+ builds on this base).
+ *  @desc        TeamPlay LEADER entry.
  *
- *               Philosophy: build on top of existing, working code. Don't reimplement
- *               things SoloPlay already does well.
+ *               Loads TeamPlay's observability layer (logger, state, IPC, status)
+ *               FIRST — that way team.json is initialized and log files open before
+ *               SoloPlay takes over the OOG loop. Then delegates to SoloPlay's
+ *               proven entry for login / char creation / game creation / town
+ *               chores / AutoMule.
+ *
+ *               Philosophy: build on top of existing, working code. SoloPlay does
+ *               90% of what we need at this layer — TeamPlay just adds team-wide
+ *               observability + coordination primitives.
  *
  *  @typedef {import("./sdk/globals")}
  */
 
-// Delegate ALL OOG logic (login, char creation, game creation, town chores) to SoloPlay.
-include("SoloPlay/OOG/SoloEntry.js");
+include("critical.js");
 
-// NOTE: SoloEntry.js's main loop doesn't return — it handles the OOG flow itself.
-// TeamPlay-specific bootstrap (logger, state, IPC) is invoked FROM SoloPlay's flow
-// via a TeamPlay hook that lives in libs/TeamPlay/ and is loaded by SoloPlay's own
-// include chain later in the PR sequence. For now this .dbj exists so the profile
-// has a distinct Entry value for D2Bot# — functionally equivalent to D2BotSoloPlay.dbj.
+// --- TeamPlay observability bootstrap (runs BEFORE SoloPlay's OOG flow) ---
+// Wrapped in try/catch so a TeamPlay bug can never wedge the bot. If bootstrap
+// fails, the bot still runs as pure SoloPlay.
+try {
+	const TeamEntry = require("./libs/TeamPlay/OOG/TeamEntry");
+	TeamEntry.bootstrap("lead");
+	D2Bot.printToConsole("TeamPlay boot (Lead role)", sdk.colors.D2Bot.DarkGold);
+} catch (e) {
+	D2Bot.printToConsole("TeamPlay bootstrap failed: " + e.message, sdk.colors.D2Bot.Red);
+}
+
+// Delegate the full OOG lifecycle (login, char creation, game creation, town chores,
+// AutoMule, TorchSystem, Gambling) to SoloPlay. SoloEntry.js enters its own main
+// loop and doesn't return — TeamPlay coordination runs as kolbot threads alongside
+// SoloPlay's flow (see libs/TeamPlay/Threads/*).
+include("SoloPlay/OOG/SoloEntry.js");
