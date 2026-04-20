@@ -61,6 +61,35 @@
 		// Char creation is inherited from SoloPlay's OOG (ControlAction.makeCharacter
 		// in libs/SoloPlay/OOG/OOGOverrides.js) — we don't reimplement it.
 
+		// --- Install team-tick Worker -------------------------------------
+		// kolbot's libs/modules/Worker.js provides a cooperative-multitasking
+		// runInBackground facility: registered functions are invoked on the
+		// main event loop between script delays. We use it to publish this
+		// bot's status snapshot + update team.json heartbeat every ~5 seconds
+		// so the leader's overview + cross-profile liveness detection stay
+		// fresh without spawning a separate OS thread.
+		try {
+			const Worker = require("../../modules/Worker");
+			let lastTick = 0;
+			Worker.runInBackground.teamPlayTick = function () {
+				const now = getTickCount();
+				if (now - lastTick < 5000) return true; // run every ~5s, keep worker alive
+				lastTick = now;
+				try {
+					TeamStatus.publish();
+					TeamState.heartbeat();
+				} catch (inner) {
+					// Surface via TeamLogger so we don't lose the error silently,
+					// but never propagate — logging must not wedge the bot.
+					try { TeamLogger.error("tick", "publish/heartbeat failed: " + inner.message); } catch (_) {}
+				}
+				return true; // continue running next cycle
+			};
+			TeamLogger.info("bootstrap", "teamPlayTick worker installed");
+		} catch (e) {
+			TeamLogger.warn("bootstrap", "could not install teamPlayTick worker: " + e.message);
+		}
+
 		TeamLogger.info("bootstrap", "TeamPlay bootstrap complete", {
 			role: role,
 			profile: TeamProfile.name(),
