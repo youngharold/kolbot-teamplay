@@ -70,18 +70,36 @@
 		// fresh without spawning a separate OS thread.
 		try {
 			const Worker = require("../../modules/Worker");
+
+			// Lazy-require role handlers. Both modules are safe to load at
+			// bootstrap time (no Team.js dependency, no side effects).
+			const TeamLeader = require("../Roles/TeamLeader");
+			const TeamFollower = require("../Roles/TeamFollower");
+
 			let lastTick = 0;
 			Worker.runInBackground.teamPlayTick = function () {
 				const now = getTickCount();
 				if (now - lastTick < 5000) return true; // run every ~5s, keep worker alive
 				lastTick = now;
 				try {
+					// Universal per-tick work: every bot publishes its snapshot
+					// and bumps heartbeat so the leader can aggregate + crash
+					// detection has fresh data.
 					TeamStatus.publish();
 					TeamState.heartbeat();
+
+					// Role-specific work: leader renders team overview, follower
+					// watches target changes. Each tick() is a cheap no-op if
+					// there's nothing to do.
+					if (TeamState.isLeader()) {
+						TeamLeader.tick();
+					} else {
+						TeamFollower.tick();
+					}
 				} catch (inner) {
 					// Surface via TeamLogger so we don't lose the error silently,
 					// but never propagate — logging must not wedge the bot.
-					try { TeamLogger.error("tick", "publish/heartbeat failed: " + inner.message); } catch (_) {}
+					try { TeamLogger.error("tick", "per-tick work failed: " + inner.message); } catch (_) {}
 				}
 				return true; // continue running next cycle
 			};
